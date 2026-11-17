@@ -1,0 +1,441 @@
+import { Router } from "express";
+import { pool } from "./db.js";
+
+const REASONS = ["down", "changed", "stolen", "other"];
+const router = Router();
+
+const BASE = `
+  SELECT a.id, a.product_id, a.email, a.password, a.cost, a.is_down, a.notes, a.created_at,
+         a.sale_mode, a.profile_slots,
+         (SELECT COUNT(*) FROM profile_sales ps WHERE ps.account_id = a.id AND ps.status = 'active') AS profiles_used,
+         p.name AS product_name,
+         COALESCE(cat.name, 'Sin categoría') AS category_name,
+         r.id AS rental_id, r.end_date AS rental_end, c.name AS customer_name,
+         DATEDIFF(r.end_date, CURDATE()) AS days_left,
+         CASE WHEN a.is_down = 1 THEN 'down'
+              WHEN a.sale_mode = 'profiles' THEN 'profiles'
+              WHEN r.id IS NOT NULL THEN 'assigned'
+              ELSE 'free' END AS state
+  FROM accounts a
+  JOIN products p ON p.id = a.product_id
+  LEFT JOIN categories cat ON cat.id = p.category_id
+  LEFT JOIN rentals r ON r.account_id = a.id AND r.status = 'active'
+  LEFT JOIN customers c ON c.id = r.customer_id
+  WHERE a.deleted_at IS NULL`;
+
+async function isDuplicate(productId, email, excludeId = 0) {
+  const [rows] = await pool.query(
+    `SELECT id FROM accounts
+     WHERE product_id = ? AND LOWER(email) = LOWER(?) AND deleted_at IS NULL AND id <> ? LIMIT 1`,
+    [productId, email, excludeId],
+  );
+  return rows.length > 0;
+}
+
+const MODES = ["full", "profiles"];
+
+const HAS_ACTIVE_SALE = `(
+  EXISTS (SELECT 1 FROM rentals r WHERE r.account_id = accounts.id AND r.status = 'active')
+  OR EXISTS (SELECT 1 FROM profile_sales ps WHERE ps.account_id = accounts.id AND ps.status = 'active'))`;
+
+function readSale(body, cur = { sale_mode: "full", profile_slots: 0 }) {
+  const sale_mode =
+    body.sale_mode === undefined ? cur.sale_mode : body.sale_mode;
+  if (!MODES.includes(sale_mode)) return { error: "Tipo de venta no válido" };
+  if (sale_mode === "full") return { sale_mode, slots: 0 };
+  const slots = Math.floor(
+    Number(
+      body.profile_slots === undefined ? cur.profile_slots : body.profile_slots,
+    ),
+  );
+  if (!(slots >= 1 && slots <= 20))
+    return { error: "Indica cuántos perfiles tiene la cuenta (de 1 a 20)" };
+  return { sale_mode, slots };
+}
+
+export async function purgeTrash({ onlyExpired = true } = {}) {
+  const [rows] = await pool.query(
+    `SELECT id FROM accounts
+     WHERE deleted_at IS NOT NULL
+       ${onlyExpired ? "AND deleted_at < NOW() - INTERVAL 30 DAY" : ""}
+       AND NOT ${HAS_ACTIVE_SALE}`,
+  );
+  if (!rows.length) return 0;
+  const ids = rows.map((r) => r.id);
+  await pool.query("DELETE FROM rentals WHERE account_id IN (?)", [ids]);
+  await pool.query("DELETE FROM profile_sales WHERE account_id IN (?)", [ids]);
+  const [res] = await pool.query("DELETE FROM accounts WHERE id IN (?)", [ids]);
+  return res.affectedRows;
+}
+
+router.get("/", async (req, res, next) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(200, Number(req.query.limit) || 25);
+    const dir = req.query.dir === "asc" ? "ASC" : "DESC";
+    const SORTS = {
+      recent: (d) => `id ${d}`,
+      days_asc: () => "days_left IS NULL, days_left ASC, id DESC",
+      days_desc: () => "days_left IS NULL, days_left DESC, id DESC",
+      days: (d) => `days_left IS NULL, days_left ${d}, id DESC`,
+      product: (d) => `product_name ${d}, email ASC`,
+      email: (d) => `email ${d}`,
+      password: (d) => `password ${d}, id DESC`,
+      state: (d) =>
+        `FIELD(state, 'free', 'assigned', 'profiles', 'down') ${d}, id DESC`,
+      customer: (d) =>
+        `customer_name IS NULL, customer_name ${d}, profiles_used ${d}, id DESC`,
+    };
+    const order = (SORTS[req.query.sort] || SORTS.recent)(dir);
+    const where = [];
+    const params = [];
+    if (req.query.state) {
+      where.push("state = ?");
+      params.push(req.query.state);
+    }
+    if (req.query.product_id) {
+      where.push("product_id = ?");
+      params.push(Number(req.query.product_id));
+    }
+    if (req.query.q) {
+      const like = `%${req.query.q}%`;
+      where.push(
+        "(email LIKE ? OR product_name LIKE ? OR customer_name LIKE ?)",
+      );
+      params.push(like, like, like);
+    }
+    const from = `FROM (${BASE}) x ${where.length ? "WHERE " + where.join(" AND ") : ""}`;
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total ${from}`,
+      params,
+    );
+    const [data] = await pool.query(
+      `SELECT * ${from} ORDER BY ${order} LIMIT ? OFFSET ?`,
+      [...params, limit, (page - 1) * limit],
+    );
+
+    const [cnt] = await pool.query(
+      `SELECT state, COUNT(*) AS n FROM (${BASE}) x GROUP BY state`,
+    );
+    const counts = { free: 0, assigned: 0, down: 0, profiles: 0 };
+    cnt.forEach((c) => {
+      counts[c.state] = Number(c.n);
+    });
+
+    res.json({ data, total, page, limit, counts });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.get("/trash", async (req, res, next) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(200, Number(req.query.limit) || 25);
+    const dir = req.query.dir === "asc" ? "ASC" : "DESC";
+    const SORTS = {
+      deleted: (d) => `a.deleted_at ${d}, a.id DESC`,
+      days: (d) => `a.deleted_at ${d}, a.id DESC`,
+      product: (d) => `p.name ${d}, a.email ASC`,
+      email: (d) => `a.email ${d}`,
+      password: (d) => `a.password ${d}, a.id DESC`,
+      reason: (d) => `FIELD(a.delete_reason, 'down', 'changed', 'stolen', 'other') ${d}, a.deleted_at DESC`,
+    };
+    const orderBy = (SORTS[req.query.sort] || SORTS.deleted)(dir);
+
+    const where = ["a.deleted_at IS NOT NULL"];
+    const params = [];
+    if (REASONS.includes(req.query.reason)) {
+      where.push("a.delete_reason = ?");
+      params.push(req.query.reason);
+    }
+    if (req.query.q) {
+      where.push("(a.email LIKE ? OR p.name LIKE ?)");
+      params.push(`%${req.query.q}%`, `%${req.query.q}%`);
+    }
+    const from = `FROM accounts a JOIN products p ON p.id = a.product_id WHERE ${where.join(" AND ")}`;
+    const [[{ total }]] = await pool.query(
+      `SELECT COUNT(*) AS total ${from}`,
+      params,
+    );
+    const [data] = await pool.query(
+      `SELECT a.id, a.email, a.password, a.deleted_at, a.delete_reason, p.name AS product_name,
+              GREATEST(0, 30 - DATEDIFF(CURDATE(), DATE(a.deleted_at))) AS days_left
+       ${from} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+      [...params, limit, (page - 1) * limit],
+    );
+    res.json({ data, total, page, limit });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.post("/:id/down", async (req, res, next) => {
+  try {
+    const flag = req.body.down ? 1 : 0;
+    const [r] = await pool.query(
+      `UPDATE accounts
+       SET down_since = ${flag ? "IF(is_down = 1 AND down_since IS NOT NULL, down_since, NOW())" : "NULL"},
+           is_down = ?
+       WHERE id = ? AND deleted_at IS NULL`,
+      [flag, req.params.id],
+    );
+    if (!r.affectedRows)
+      return res.status(404).json({ error: "No encontrada" });
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.post("/", async (req, res, next) => {
+  try {
+    const {
+      product_id,
+      email = "",
+      password = "",
+      cost = 0,
+      notes = null,
+    } = req.body;
+    if (!product_id || !email.trim())
+      return res
+        .status(400)
+        .json({ error: "El servicio y el correo son obligatorios" });
+    const sale = readSale(req.body);
+    if (sale.error) return res.status(400).json({ error: sale.error });
+    if (await isDuplicate(product_id, email.trim()))
+      return res
+        .status(409)
+        .json({
+          error: "Ya existe una cuenta con ese correo en este servicio",
+        });
+    const [r] = await pool.query(
+      "INSERT INTO accounts (product_id, email, password, cost, notes, sale_mode, profile_slots) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [
+        product_id,
+        email.trim(),
+        password,
+        Number(cost) || 0,
+        notes || null,
+        sale.sale_mode,
+        sale.slots,
+      ],
+    );
+    res.status(201).json({ id: r.insertId });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.post("/bulk", async (req, res, next) => {
+  try {
+    const { product_id, cost = 0, items = [] } = req.body;
+    if (!product_id)
+      return res.status(400).json({ error: "Elige el servicio" });
+    if (!Array.isArray(items) || !items.length)
+      return res.status(400).json({ error: "No hay cuentas para subir" });
+    if (items.length > 2000)
+      return res.status(400).json({ error: "Máximo 2000 cuentas por carga" });
+    const sale = readSale(req.body);
+    if (sale.error) return res.status(400).json({ error: sale.error });
+
+    const [[prod]] = await pool.query("SELECT id FROM products WHERE id = ?", [
+      product_id,
+    ]);
+    if (!prod) return res.status(400).json({ error: "Servicio no encontrado" });
+
+    const [existing] = await pool.query(
+      "SELECT LOWER(email) AS email FROM accounts WHERE product_id = ? AND deleted_at IS NULL",
+      [product_id],
+    );
+    const seen = new Set(existing.map((r) => r.email));
+
+    const rows = [];
+    const duplicates = [];
+    for (const it of items) {
+      const email = String(it.email || "").trim();
+      const password = String(it.password || "").trim();
+      if (!email) continue;
+      const key = email.toLowerCase();
+      if (seen.has(key)) {
+        duplicates.push(email);
+        continue;
+      }
+      seen.add(key);
+      rows.push([
+        product_id,
+        email,
+        password,
+        Number(cost) || 0,
+        sale.sale_mode,
+        sale.slots,
+      ]);
+    }
+    if (rows.length)
+      await pool.query(
+        "INSERT INTO accounts (product_id, email, password, cost, sale_mode, profile_slots) VALUES ?",
+        [rows],
+      );
+
+    res.status(201).json({
+      created: rows.length,
+      duplicates: duplicates.length,
+      duplicate_list: duplicates.slice(0, 20),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.post("/trash-many", async (req, res, next) => {
+  try {
+    const { ids = [], reason } = req.body;
+    if (!REASONS.includes(reason))
+      return res.status(400).json({ error: "Motivo no válido" });
+    if (!Array.isArray(ids) || !ids.length)
+      return res.status(400).json({ error: "No hay cuentas seleccionadas" });
+    const [r] = await pool.query(
+      `UPDATE accounts SET deleted_at = NOW(), delete_reason = ?
+       WHERE id IN (?) AND deleted_at IS NULL AND NOT ${HAS_ACTIVE_SALE}`,
+      [reason, ids],
+    );
+    res.json({ trashed: r.affectedRows, skipped: ids.length - r.affectedRows });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.delete("/trash", async (req, res, next) => {
+  try {
+    res.json({ deleted: await purgeTrash({ onlyExpired: false }) });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.put("/:id", async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const {
+      product_id,
+      email = "",
+      password = "",
+      cost = 0,
+      notes = null,
+    } = req.body;
+    if (!product_id || !email.trim())
+      return res
+        .status(400)
+        .json({ error: "El servicio y el correo son obligatorios" });
+
+    const [[cur]] = await pool.query(
+      "SELECT sale_mode, profile_slots FROM accounts WHERE id = ? AND deleted_at IS NULL",
+      [id],
+    );
+    if (!cur) return res.status(404).json({ error: "No encontrada" });
+
+    const sale = readSale(req.body, cur);
+    if (sale.error) return res.status(400).json({ error: sale.error });
+
+    const [[busy]] = await pool.query(
+      `SELECT (SELECT COUNT(*) FROM rentals WHERE account_id = ? AND status = 'active') AS rentals,
+              (SELECT COUNT(*) FROM profile_sales WHERE account_id = ? AND status = 'active') AS profiles`,
+      [id, id],
+    );
+    const activeRentals = Number(busy.rentals);
+    const activeProfiles = Number(busy.profiles);
+
+    if (sale.sale_mode !== cur.sale_mode && (activeRentals || activeProfiles))
+      return res.status(409).json({
+        error:
+          "No puedes cambiar el tipo de venta mientras la cuenta tenga alquileres o perfiles activos. Córtalos primero.",
+      });
+    if (sale.sale_mode === "profiles" && sale.slots < activeProfiles)
+      return res.status(409).json({
+        error: `La cuenta ya tiene ${activeProfiles} perfiles vendidos; no puedes dejarla con menos.`,
+      });
+
+    if (await isDuplicate(product_id, email.trim(), id))
+      return res.status(409).json({
+        error: "Ya existe otra cuenta con ese correo en este servicio",
+      });
+
+    await pool.query(
+      `UPDATE accounts
+       SET product_id = ?, email = ?, password = ?, cost = ?, notes = ?, sale_mode = ?, profile_slots = ?
+       WHERE id = ? AND deleted_at IS NULL`,
+      [
+        product_id,
+        email.trim(),
+        password,
+        Number(cost) || 0,
+        notes || null,
+        sale.sale_mode,
+        sale.slots,
+        id,
+      ],
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.post("/:id/down", async (req, res, next) => {
+  try {
+    const [r] = await pool.query(
+      "UPDATE accounts SET is_down = ? WHERE id = ? AND deleted_at IS NULL",
+      [req.body.down ? 1 : 0, req.params.id],
+    );
+    if (!r.affectedRows)
+      return res.status(404).json({ error: "No encontrada" });
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.post("/:id/restore", async (req, res, next) => {
+  try {
+    const [r] = await pool.query(
+      `UPDATE accounts SET deleted_at = NULL, delete_reason = NULL, is_down = 0, down_since = NULL
+        WHERE id = ? AND deleted_at IS NOT NULL`,
+      [req.params.id],
+    );
+    if (!r.affectedRows)
+      return res.status(404).json({ error: "No está en la papelera" });
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
+});
+
+router.delete("/:id/purge", async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const [[acc]] = await pool.query(
+      "SELECT id FROM accounts WHERE id = ? AND deleted_at IS NOT NULL",
+      [id],
+    );
+    if (!acc) return res.status(404).json({ error: "No está en la papelera" });
+
+    const [[busy]] = await pool.query(
+      `SELECT (SELECT COUNT(*) FROM rentals WHERE account_id = ? AND status = 'active') AS rentals,
+              (SELECT COUNT(*) FROM profile_sales WHERE account_id = ? AND status = 'active') AS profiles`,
+      [id, id],
+    );
+    if (Number(busy.rentals) || Number(busy.profiles))
+      return res
+        .status(409)
+        .json({ error: "Esa cuenta aún tiene un alquiler o perfiles activos" });
+
+    await pool.query("DELETE FROM rentals WHERE account_id = ?", [id]);
+    await pool.query("DELETE FROM profile_sales WHERE account_id = ?", [id]);
+    await pool.query("DELETE FROM accounts WHERE id = ?", [id]);
+    res.status(204).end();
+  } catch (e) {
+    next(e);
+  }
+});
+
+export default router;
